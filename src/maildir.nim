@@ -36,7 +36,7 @@ when isMainModule:
   proc deliverCmd(path: string, message: string = ""): int =
     ## Deliver a message to a maildir. Reads from stdin if no message given.
     try:
-      let md = open(path)
+      let md = openMaildir(path)
       let content = if message.len > 0: message
                     else: stdin.readAll()
       let msg = md.deliver(content)
@@ -49,7 +49,7 @@ when isMainModule:
                count: bool = false): int =
     ## List messages in a maildir
     try:
-      let md = open(path)
+      let md = openMaildir(path)
       if count:
         let c = md.count()
         echo c.newMsgs, " new, ", c.curMsgs, " cur"
@@ -68,7 +68,7 @@ when isMainModule:
   proc readCmd(path: string, name: string): int =
     ## Read a message from a maildir by unique name (or prefix)
     try:
-      let md = open(path)
+      let md = openMaildir(path)
       let msg = md.get(name)
       stdout.write msg.read()
     except:
@@ -81,7 +81,7 @@ when isMainModule:
                passed: bool = false): int =
     ## Set flags on a message
     try:
-      let md = open(path)
+      let md = openMaildir(path)
       var msg = md.get(name)
       var flags = msg.flags
       if seen: flags.incl fSeen
@@ -99,7 +99,7 @@ when isMainModule:
   proc deleteCmd(path: string, name: string): int =
     ## Delete a message from a maildir
     try:
-      let md = open(path)
+      let md = openMaildir(path)
       let msg = md.get(name)
       md.delete(msg)
       echo "Deleted: ", name
@@ -110,7 +110,7 @@ when isMainModule:
   proc purgeCmd(path: string): int =
     ## Delete all messages flagged as trashed
     try:
-      let md = open(path)
+      let md = openMaildir(path)
       md.purge()
       echo "Purged trashed messages"
     except:
@@ -120,7 +120,7 @@ when isMainModule:
   proc cleanCmd(path: string): int =
     ## Remove stale files from tmp/
     try:
-      let md = open(path)
+      let md = openMaildir(path)
       md.cleanTmp()
       echo "Cleaned tmp/"
     except:

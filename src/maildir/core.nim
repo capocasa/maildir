@@ -6,7 +6,7 @@
 ## - Atomic delivery via tmp -> new rename
 ## - Flags encoded in filename suffix after `:2,`
 
-import std/[os, times, strutils, sequtils, algorithm, posix]
+import std/[os, times, strutils, algorithm, posix, tables]
 
 type
   Flag* = enum
@@ -90,19 +90,91 @@ proc init*(path: string): Maildir =
   createDir(path / "new")
   createDir(path / "cur")
 
-proc open*(path: string): Maildir =
+proc openMaildir*(path: string): Maildir =
   ## Open an existing maildir. Raises if the directory structure is missing.
   if not dirExists(path / "tmp") or not dirExists(path / "new") or not dirExists(path / "cur"):
     raise newException(IOError, "Not a valid maildir: " & path)
   result = Maildir(path: path)
 
+proc parseHeaders(content: string): OrderedTable[string, string] =
+  ## Parse email headers from content. Returns header names lowercased as keys.
+  ## Handles continuation lines (lines starting with whitespace).
+  result = initOrderedTable[string, string]()
+  var currentKey = ""
+  for line in content.splitLines():
+    if line.len == 0:
+      break  # empty line = end of headers
+    if line[0] in {' ', '\t'} and currentKey.len > 0:
+      # continuation line
+      result[currentKey] &= "\n" & line
+    else:
+      let colonPos = line.find(':')
+      if colonPos < 0:
+        break  # not a header line, treat as body start
+      currentKey = line[0 ..< colonPos].strip().toLowerAscii()
+      let value = line[colonPos + 1 .. ^1].strip()
+      result[currentKey] = value
+
+proc hasHeader(content: string, name: string): bool =
+  ## Check if a header exists in the message content.
+  let headers = parseHeaders(content)
+  name.toLowerAscii() in headers
+
+proc addMissingHeaders(content: string, uniqueName: string): string =
+  ## Add default headers that aren't already present. Never overrides existing.
+  var headers = parseHeaders(content)
+  var toAdd: seq[string]
+
+  # Generate Message-ID if missing
+  if "message-id" notin headers:
+    var hostname = newString(256)
+    discard getHostname(cstring(hostname), 256)
+    hostname.setLen(hostname.cstring.len)
+    toAdd.add "Message-ID: <" & uniqueName & "@" & hostname & ">"
+
+  # Date in RFC 2822 format
+  if "date" notin headers:
+    let now = now().utc()
+    toAdd.add "Date: " & now.format("ddd, dd MMM yyyy HH:mm:ss") & " +0000"
+
+  # MIME headers
+  if "mime-version" notin headers:
+    toAdd.add "MIME-Version: 1.0"
+  if "content-type" notin headers:
+    toAdd.add "Content-Type: text/plain; charset=utf-8"
+  if "content-transfer-encoding" notin headers:
+    toAdd.add "Content-Transfer-Encoding: 8bit"
+
+  if toAdd.len == 0:
+    return content
+
+  # Insert defaults after existing headers, before the blank line
+  let blankPos = content.find("\n\n")
+  if blankPos >= 0:
+    result = content[0 ..< blankPos] & "\n" & toAdd.join("\n") & content[blankPos .. ^1]
+  else:
+    # No blank line found — all headers, no body
+    result = content & "\n" & toAdd.join("\n") & "\n\n"
+
+proc validateHeaders*(content: string) =
+  ## Validate that required headers are present. Raises ValueError if not.
+  let headers = parseHeaders(content)
+  if "from" notin headers:
+    raise newException(ValueError, "Missing required header: From")
+  if "to" notin headers:
+    raise newException(ValueError, "Missing required header: To")
+
 proc deliver*(md: Maildir, content: string): Message =
-  ## Deliver a message to the maildir. Writes to tmp/ first, then atomically
-  ## moves to new/. Returns the resulting Message.
+  ## Deliver a message to the maildir. Validates that From and To headers
+  ## are present, adds default headers (Date, MIME-Version, Content-Type,
+  ## Content-Transfer-Encoding, Message-ID) if missing, then writes to tmp/
+  ## and atomically moves to new/. Returns the resulting Message.
+  validateHeaders(content)
   let name = generateUniqueName()
+  let prepared = addMissingHeaders(content, name)
   let tmpPath = md.path / "tmp" / name
   let newPath = md.path / "new" / name
-  writeFile(tmpPath, content)
+  writeFile(tmpPath, prepared)
   moveFile(tmpPath, newPath)
   result = parseMessagePath(newPath)
 
