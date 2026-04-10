@@ -6,7 +6,7 @@
 ## - Atomic delivery via tmp -> new rename
 ## - Flags encoded in filename suffix after `:2,`
 
-import std/[os, times, strutils, algorithm, posix, tables]
+import std/[os, times, strutils, algorithm, posix, tables, base64]
 
 type
   Flag* = enum
@@ -24,6 +24,12 @@ type
     dir*: string       ## "new" or "cur"
     uniqueName*: string ## The unique filename portion (before :2,)
     flags*: set[Flag]  ## Current flags
+
+  Attachment* = object
+    ## An email attachment
+    filename*: string
+    contentType*: string
+    data*: string
 
   Maildir* = object
     ## A maildir directory
@@ -164,14 +170,101 @@ proc validateHeaders*(content: string) =
   if "to" notin headers:
     raise newException(ValueError, "Missing required header: To")
 
-proc deliver*(md: Maildir, content: string): Message =
+proc generateBoundary(): string =
+  ## Generate a unique MIME boundary string
+  let t = epochTime()
+  let secs = int(t)
+  let usecs = int((t - float(secs)) * 1_000_000)
+  inc counter
+  result = "----=_maildir_" & $secs & "." & $usecs & "." & $counter
+
+proc wrapBase64(encoded: string, lineLen: int = 76): string =
+  ## Wrap base64 encoded string to specified line length per RFC 2045
+  var i = 0
+  while i < encoded.len:
+    let endPos = min(i + lineLen, encoded.len)
+    if result.len > 0:
+      result.add "\n"
+    result.add encoded[i ..< endPos]
+    i = endPos
+
+proc buildMultipart(content: string, attachments: seq[Attachment]): string =
+  ## Build a multipart/mixed message from content and attachments.
+  ## Moves any Content-Type and Content-Transfer-Encoding from the top-level
+  ## headers into the first MIME part (the message body).
+  let boundary = generateBoundary()
+
+  # Split into headers and body
+  let blankPos = content.find("\n\n")
+  var origHeaders, origBody: string
+  if blankPos >= 0:
+    origHeaders = content[0 ..< blankPos]
+    origBody = content[blankPos + 2 .. ^1]
+  else:
+    origHeaders = content
+    origBody = ""
+
+  # Get body part content-type from original headers
+  let parsed = parseHeaders(content)
+  var bodyContentType = "text/plain; charset=utf-8"
+  var bodyEncoding = "8bit"
+  if "content-type" in parsed:
+    bodyContentType = parsed["content-type"]
+  if "content-transfer-encoding" in parsed:
+    bodyEncoding = parsed["content-transfer-encoding"]
+
+  # Rebuild top-level headers without content-type and content-transfer-encoding
+  var newHeaders: seq[string]
+  var skipCont = false
+  for line in origHeaders.splitLines():
+    if line.len > 0 and line[0] in {' ', '\t'}:
+      if not skipCont:
+        newHeaders.add line
+      continue
+    let lower = line.toLowerAscii()
+    if lower.startsWith("content-type:") or lower.startsWith("content-transfer-encoding:"):
+      skipCont = true
+    else:
+      skipCont = false
+      newHeaders.add line
+
+  result = newHeaders.join("\n")
+  result &= "\nContent-Type: multipart/mixed; boundary=\"" & boundary & "\""
+  result &= "\n\n"
+
+  # Body part
+  result &= "--" & boundary & "\n"
+  result &= "Content-Type: " & bodyContentType & "\n"
+  result &= "Content-Transfer-Encoding: " & bodyEncoding & "\n"
+  result &= "\n"
+  result &= origBody & "\n"
+
+  # Attachment parts
+  for att in attachments:
+    result &= "--" & boundary & "\n"
+    result &= "Content-Type: " & att.contentType
+    if att.filename.len > 0:
+      result &= "; name=\"" & att.filename & "\""
+    result &= "\n"
+    if att.filename.len > 0:
+      result &= "Content-Disposition: attachment; filename=\"" & att.filename & "\"\n"
+    result &= "Content-Transfer-Encoding: base64\n"
+    result &= "\n"
+    result &= wrapBase64(encode(att.data)) & "\n"
+
+  result &= "--" & boundary & "--\n"
+
+proc deliver*(md: Maildir, content: string, attachments: seq[Attachment] = @[]): Message =
   ## Deliver a message to the maildir. Validates that From and To headers
   ## are present, adds default headers (Date, MIME-Version, Content-Type,
   ## Content-Transfer-Encoding, Message-ID) if missing, then writes to tmp/
   ## and atomically moves to new/. Returns the resulting Message.
   validateHeaders(content)
   let name = generateUniqueName()
-  let prepared = addMissingHeaders(content, name)
+  let prepared = if attachments.len > 0:
+                   addMissingHeaders(buildMultipart(content, attachments), name)
+                 else:
+                   addMissingHeaders(content, name)
   let tmpPath = md.path / "tmp" / name
   let newPath = md.path / "new" / name
   writeFile(tmpPath, prepared)
@@ -271,3 +364,119 @@ proc cleanTmp*(md: Maildir, maxAge: Duration = initDuration(hours = 36)) =
       let info = getFileInfo(path)
       if now - info.lastWriteTime > maxAge:
         removeFile(path)
+
+proc parseBoundary(content: string): string =
+  ## Extract the boundary string from a multipart Content-Type header
+  let headers = parseHeaders(content)
+  if "content-type" in headers:
+    let ct = headers["content-type"]
+    let bpos = ct.find("boundary=")
+    if bpos >= 0:
+      var b = ct[bpos + 9 .. ^1]
+      if b.startsWith("\""):
+        let endQ = b.find("\"", 1)
+        if endQ >= 0:
+          b = b[1 ..< endQ]
+      else:
+        let endPos = b.find({';', ' ', '\t', '\n', '\r'})
+        if endPos >= 0:
+          b = b[0 ..< endPos]
+      return b
+
+proc parseMimeParts(content: string): seq[string] =
+  ## Split a multipart message into its MIME parts (excluding preamble and epilogue)
+  let boundary = parseBoundary(content)
+  if boundary.len == 0:
+    return @[]
+  let delim = "--" & boundary
+  let parts = content.split(delim)
+  for i in 1 ..< parts.len:
+    let part = parts[i]
+    if part.startsWith("--"):
+      break
+    # Strip the leading newline after the boundary line
+    result.add(if part.startsWith("\r\n"): part[2..^1]
+               elif part.startsWith("\n"): part[1..^1]
+               else: part)
+
+proc extractFilename(header: string): string =
+  ## Extract filename from Content-Disposition or Content-Type header value
+  for prefix in ["filename=", "name="]:
+    let pos = header.find(prefix)
+    if pos >= 0:
+      var name = header[pos + prefix.len .. ^1]
+      if name.startsWith("\""):
+        let endQ = name.find("\"", 1)
+        if endQ >= 0:
+          return name[1 ..< endQ]
+      else:
+        let endPos = name.find({';', ' ', '\t', '\n', '\r'})
+        if endPos >= 0:
+          return name[0 ..< endPos]
+        return name
+
+proc listAttachments*(content: string): seq[Attachment] =
+  ## List attachments in a message. Returns Attachment objects with empty data.
+  let parts = parseMimeParts(content)
+  if parts.len <= 1:
+    return @[]
+
+  for i in 1 ..< parts.len:
+    let headers = parseHeaders(parts[i])
+    var filename = ""
+    var contentType = "application/octet-stream"
+
+    if "content-disposition" in headers:
+      filename = extractFilename(headers["content-disposition"])
+    if "content-type" in headers:
+      let ct = headers["content-type"]
+      if filename.len == 0:
+        filename = extractFilename(ct)
+      let semiPos = ct.find(";")
+      contentType = if semiPos >= 0: ct[0 ..< semiPos].strip() else: ct.strip()
+
+    result.add Attachment(filename: filename, contentType: contentType, data: "")
+
+proc extractAttachment*(content: string, index: int): Attachment =
+  ## Extract an attachment by 0-based index. Returns Attachment with decoded data.
+  let parts = parseMimeParts(content)
+  if parts.len <= 1:
+    raise newException(ValueError, "No attachments in message")
+  let partIdx = index + 1  # skip body part
+  if partIdx >= parts.len:
+    raise newException(IndexDefect, "Attachment index out of range: " & $index)
+
+  let part = parts[partIdx]
+  let headers = parseHeaders(part)
+
+  # Get body of this part
+  let bodyPos = part.find("\n\n")
+  if bodyPos < 0:
+    raise newException(ValueError, "Malformed MIME part")
+  let body = part[bodyPos + 2 .. ^1]
+
+  var filename = ""
+  var contentType = "application/octet-stream"
+  var isBase64 = false
+
+  if "content-disposition" in headers:
+    filename = extractFilename(headers["content-disposition"])
+  if "content-type" in headers:
+    let ct = headers["content-type"]
+    if filename.len == 0:
+      filename = extractFilename(ct)
+    let semiPos = ct.find(";")
+    contentType = if semiPos >= 0: ct[0 ..< semiPos].strip() else: ct.strip()
+  if "content-transfer-encoding" in headers:
+    isBase64 = headers["content-transfer-encoding"].strip().toLowerAscii() == "base64"
+
+  let data = if isBase64: decode(body.strip()) else: body
+  result = Attachment(filename: filename, contentType: contentType, data: data)
+
+proc extractAttachment*(content: string, filename: string): Attachment =
+  ## Extract an attachment by filename.
+  let attachments = listAttachments(content)
+  for i, att in attachments:
+    if att.filename == filename:
+      return extractAttachment(content, i)
+  raise newException(KeyError, "Attachment not found: " & filename)

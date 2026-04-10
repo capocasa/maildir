@@ -22,6 +22,7 @@ const
     mapIt(it.split("=")[1].strip().strip(chars = {'"'}))[0]
 
 when isMainModule:
+  import std/[os, mimetypes]
   import cligen
 
   proc initCmd(path: string): int =
@@ -33,13 +34,22 @@ when isMainModule:
       stderr.writeLine "Error: ", getCurrentExceptionMsg()
       return 1
 
-  proc deliverCmd(path: string, message: string = ""): int =
+  proc deliverCmd(path: string, message: string = "", attach: seq[string] = @[]): int =
     ## Deliver a message to a maildir. Reads from stdin if no message given.
+    ## Use --attach to add file attachments.
     try:
       let md = openMaildir(path)
       let content = if message.len > 0: message
                     else: stdin.readAll()
-      let msg = md.deliver(content)
+      var attachments: seq[Attachment]
+      let m = newMimetypes()
+      for filePath in attach:
+        let data = readFile(filePath)
+        let name = extractFilename(filePath)
+        let ext = splitFile(filePath).ext.toLowerAscii()
+        let ct = m.getMimetype(if ext.len > 1: ext[1..^1] else: "", default = "application/octet-stream")
+        attachments.add Attachment(filename: name, contentType: ct, data: data)
+      let msg = md.deliver(content, attachments)
       echo msg.uniqueName
     except:
       stderr.writeLine "Error: ", getCurrentExceptionMsg()
@@ -127,6 +137,45 @@ when isMainModule:
       stderr.writeLine "Error: ", getCurrentExceptionMsg()
       return 1
 
+  proc attachmentsCmd(path: string, name: string): int =
+    ## List attachments in a message
+    try:
+      let md = openMaildir(path)
+      let msg = md.get(name)
+      let content = msg.read()
+      let atts = listAttachments(content)
+      if atts.len == 0:
+        echo "No attachments"
+      else:
+        for i, att in atts:
+          echo i, "\t", att.filename, "\t", att.contentType
+    except:
+      stderr.writeLine "Error: ", getCurrentExceptionMsg()
+      return 1
+
+  proc extractCmd(path: string, name: string, index: int = -1,
+                  filename: string = "", output: string = ""): int =
+    ## Extract an attachment from a message
+    try:
+      let md = openMaildir(path)
+      let msg = md.get(name)
+      let content = msg.read()
+      let att = if filename.len > 0:
+                  extractAttachment(content, filename)
+                elif index >= 0:
+                  extractAttachment(content, index)
+                else:
+                  raise newException(ValueError, "Specify --index or --filename")
+      let outPath = if output.len > 0: output else: att.filename
+      if outPath.len > 0:
+        writeFile(outPath, att.data)
+        echo "Extracted: ", outPath
+      else:
+        stdout.write att.data
+    except:
+      stderr.writeLine "Error: ", getCurrentExceptionMsg()
+      return 1
+
   proc versionCmd(): int =
     ## Show version
     echo "maildir ", Version
@@ -138,7 +187,8 @@ when isMainModule:
     }],
     [deliverCmd, cmdName = "deliver", help = {
       "path": "Path to maildir",
-      "message": "Message content (reads stdin if empty)"
+      "message": "Message content (reads stdin if empty)",
+      "attach": "File path to attach (repeatable)"
     }],
     [listCmd, cmdName = "list", help = {
       "path": "Path to maildir",
@@ -169,6 +219,17 @@ when isMainModule:
     }],
     [cleanCmd, cmdName = "clean", help = {
       "path": "Path to maildir"
+    }],
+    [attachmentsCmd, cmdName = "attachments", help = {
+      "path": "Path to maildir",
+      "name": "Unique name or prefix of message"
+    }],
+    [extractCmd, cmdName = "extract", help = {
+      "path": "Path to maildir",
+      "name": "Unique name or prefix of message",
+      "index": "Attachment index (0-based)",
+      "filename": "Attachment filename",
+      "output": "Output file path (default: attachment filename)"
     }],
     [versionCmd, cmdName = "version"]
   )

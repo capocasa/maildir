@@ -1,4 +1,4 @@
-import std/[os, strutils, unittest]
+import std/[os, strutils, unittest, base64]
 import maildir
 
 const validMsg = "From: sender@example.com\nTo: recipient@example.com\nSubject: Test\n\nHello"
@@ -243,3 +243,128 @@ suite "headers":
     let content = msg.read()
     # No Subject was added
     check "Subject: " notin content
+
+suite "attachments":
+  let testDir = getTempDir() / "test_maildir_attach_" & $getCurrentProcessId()
+
+  setup:
+    removeDir(testDir)
+
+  teardown:
+    removeDir(testDir)
+
+  test "deliver with attachments creates multipart message":
+    let md = init(testDir)
+    let att = Attachment(filename: "test.txt", contentType: "text/plain", data: "file content")
+    let msg = md.deliver(minimalMsg("Hello body"), @[att])
+    let content = msg.read()
+    check "multipart/mixed" in content
+    check "boundary=" in content
+
+  test "deliver with attachments preserves body":
+    let md = init(testDir)
+    let att = Attachment(filename: "test.txt", contentType: "text/plain", data: "file content")
+    let msg = md.deliver(minimalMsg("Hello body"), @[att])
+    let content = msg.read()
+    check "Hello body" in content
+
+  test "deliver with attachments base64 encodes attachment data":
+    let md = init(testDir)
+    let att = Attachment(filename: "test.txt", contentType: "text/plain", data: "file content")
+    let msg = md.deliver(minimalMsg("Hello body"), @[att])
+    let content = msg.read()
+    check encode("file content") in content
+
+  test "deliver without attachments unchanged":
+    let md = init(testDir)
+    let msg = md.deliver(minimalMsg("Hello"))
+    let content = msg.read()
+    check "multipart" notin content
+    check "Content-Type: text/plain; charset=utf-8" in content
+
+  test "listAttachments returns attachment info":
+    let md = init(testDir)
+    let att = Attachment(filename: "doc.pdf", contentType: "application/pdf", data: "binary")
+    let msg = md.deliver(minimalMsg("Body"), @[att])
+    let content = msg.read()
+    let atts = listAttachments(content)
+    check atts.len == 1
+    check atts[0].filename == "doc.pdf"
+    check atts[0].contentType == "application/pdf"
+
+  test "listAttachments on plain message returns empty":
+    let md = init(testDir)
+    let msg = md.deliver(minimalMsg("Body"))
+    let atts = listAttachments(msg.read())
+    check atts.len == 0
+
+  test "extractAttachment by index":
+    let md = init(testDir)
+    let att = Attachment(filename: "test.txt", contentType: "text/plain", data: "hello world")
+    let msg = md.deliver(minimalMsg("Body"), @[att])
+    let extracted = extractAttachment(msg.read(), 0)
+    check extracted.filename == "test.txt"
+    check extracted.contentType == "text/plain"
+    check extracted.data == "hello world"
+
+  test "extractAttachment by filename":
+    let md = init(testDir)
+    let atts = @[
+      Attachment(filename: "a.txt", contentType: "text/plain", data: "aaa"),
+      Attachment(filename: "b.bin", contentType: "application/octet-stream", data: "bbb"),
+    ]
+    let msg = md.deliver(minimalMsg("Body"), atts)
+    let extracted = extractAttachment(msg.read(), "b.bin")
+    check extracted.filename == "b.bin"
+    check extracted.data == "bbb"
+
+  test "multiple attachments":
+    let md = init(testDir)
+    let atts = @[
+      Attachment(filename: "one.txt", contentType: "text/plain", data: "first"),
+      Attachment(filename: "two.txt", contentType: "text/plain", data: "second"),
+      Attachment(filename: "three.bin", contentType: "application/octet-stream", data: "third"),
+    ]
+    let msg = md.deliver(minimalMsg("Body"), atts)
+    let content = msg.read()
+    let listed = listAttachments(content)
+    check listed.len == 3
+    check listed[0].filename == "one.txt"
+    check listed[1].filename == "two.txt"
+    check listed[2].filename == "three.bin"
+    check extractAttachment(content, 0).data == "first"
+    check extractAttachment(content, 1).data == "second"
+    check extractAttachment(content, 2).data == "third"
+
+  test "binary attachment roundtrip":
+    let md = init(testDir)
+    var binaryData = ""
+    for i in 0..255:
+      binaryData.add chr(i)
+    let att = Attachment(filename: "binary.dat", contentType: "application/octet-stream", data: binaryData)
+    let msg = md.deliver(minimalMsg("Body"), @[att])
+    let extracted = extractAttachment(msg.read(), 0)
+    check extracted.data == binaryData
+
+  test "deliver with attachments preserves custom content-type for body":
+    let md = init(testDir)
+    let att = Attachment(filename: "test.txt", contentType: "text/plain", data: "data")
+    let htmlMsg = "From: a@b.com\nTo: c@d.com\nContent-Type: text/html; charset=utf-8\n\n<h1>Hi</h1>"
+    let msg = md.deliver(htmlMsg, @[att])
+    let content = msg.read()
+    check "text/html; charset=utf-8" in content
+    check "<h1>Hi</h1>" in content
+
+  test "extractAttachment out of range raises":
+    let md = init(testDir)
+    let att = Attachment(filename: "test.txt", contentType: "text/plain", data: "data")
+    let msg = md.deliver(minimalMsg("Body"), @[att])
+    expect IndexDefect:
+      discard extractAttachment(msg.read(), 5)
+
+  test "extractAttachment by missing filename raises":
+    let md = init(testDir)
+    let att = Attachment(filename: "test.txt", contentType: "text/plain", data: "data")
+    let msg = md.deliver(minimalMsg("Body"), @[att])
+    expect KeyError:
+      discard extractAttachment(msg.read(), "nonexistent.txt")
